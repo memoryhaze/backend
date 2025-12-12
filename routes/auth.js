@@ -3,7 +3,7 @@ const router = express.Router();
 const User = require('../models/User');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { sendOTPEmail } = require('../utils/emailService');
+const { sendOTPEmail, verifyTransporter } = require('../utils/emailService');
 const authMiddleware = require('../middleware/auth');
 
 // Public: Total user count
@@ -14,6 +14,19 @@ router.get('/user-count', async (req, res) => {
     } catch (err) {
         console.error(err.message);
         return res.status(500).json({ msg: 'Server error' });
+    }
+});
+
+// Diagnostics: verify email transporter configuration
+router.get('/email/verify', async (_req, res) => {
+    try {
+        const result = await verifyTransporter();
+        if (!result.success) {
+            return res.status(500).json({ ok: false, error: result.error });
+        }
+        return res.json({ ok: true });
+    } catch (err) {
+        return res.status(500).json({ ok: false, error: err.message });
     }
 });
 

@@ -1,12 +1,18 @@
 const nodemailer = require('nodemailer');
 
-// Create transporter using Gmail
+// Create transporter (configurable, defaults to Gmail SMTP)
+const smtpHost = process.env.SMTP_HOST || 'smtp.gmail.com';
+const smtpPort = Number(process.env.SMTP_PORT || 465);
+const smtpSecure = process.env.SMTP_SECURE === 'false' ? false : true; // default secure for 465
+
 const transporter = nodemailer.createTransport({
-    service: 'gmail',
+    host: smtpHost,
+    port: smtpPort,
+    secure: smtpSecure,
     auth: {
         user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS
-    }
+        pass: process.env.EMAIL_PASS,
+    },
 });
 
 // Send OTP email
@@ -174,4 +180,14 @@ const sendCredentialsEmail = async (email, password) => {
     }
 };
 
-module.exports = { sendOTPEmail, sendCredentialsEmail };
+const verifyTransporter = async () => {
+    try {
+        await transporter.verify();
+        return { success: true };
+    } catch (error) {
+        console.error('Email transporter verify error:', error);
+        return { success: false, error: error.message };
+    }
+};
+
+module.exports = { sendOTPEmail, sendCredentialsEmail, verifyTransporter };
