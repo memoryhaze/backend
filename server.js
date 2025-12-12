@@ -13,9 +13,13 @@ app.use(cors());
 app.use(express.json());
 
 // Database Connection
-mongoose.connect('mongodb://localhost:27017/memoryhaze')
-    .then(() => console.log('MongoDB connected'))
-    .catch(err => console.log(err));
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/memoryhaze';
+mongoose
+  .connect(MONGODB_URI)
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => {
+    console.error('MongoDB connection error:', err.message);
+  });
 
 // Routes
 const authRoutes = require('./routes/auth');
