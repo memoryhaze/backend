@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const User = require('../models/User');
+const Gift = require('../models/Gift');
 const authMiddleware = require('../middleware/auth');
 const requireAdmin = require('../middleware/requireAdmin');
 const bcrypt = require('bcryptjs');
@@ -100,6 +101,48 @@ router.post('/users', authMiddleware, requireAdmin, async (req, res) => {
         });
     } catch (err) {
         console.error('Admin POST /users error:', err);
+        return res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// POST /api/admin/gifts - Create a gift for a user (admin only)
+router.post('/gifts', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        const {
+            userId,
+            templateId,
+            scenarios = [],
+            memory = null,
+            plan = null,
+            photos = [],
+            audio = null,
+            lyrics = '',
+        } = req.body || {};
+
+        if (!userId || !templateId) {
+            return res.status(400).json({ error: 'userId and templateId are required' });
+        }
+
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        const gift = new Gift({
+            user: user._id,
+            templateId,
+            scenarios: Array.isArray(scenarios) ? scenarios : [],
+            memory,
+            plan,
+            photos: Array.isArray(photos) ? photos : [],
+            audio,
+            lyrics: typeof lyrics === 'string' ? lyrics : '',
+        });
+
+        await gift.save();
+        return res.status(201).json({ gift });
+    } catch (err) {
+        console.error('Admin POST /gifts error:', err);
         return res.status(500).json({ error: 'Server error' });
     }
 });

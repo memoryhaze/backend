@@ -24,8 +24,10 @@ mongoose
 // Routes
 const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
+const giftsRoutes = require('./routes/gifts');
 app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/gifts', giftsRoutes);
 
 app.get('/', (req, res) => {
     res.send('API is running...');
