@@ -8,9 +8,13 @@ const requireAdmin = require('../middleware/requireAdmin');
 const bcrypt = require('bcryptjs');
 const { sendCredentialsEmail, sendGiftNotificationEmail } = require('../utils/emailService');
 const { encryptUserId } = require('../utils/encryption');
-const crypto = require('crypto');
-const https = require('https');
-const querystring = require('querystring');
+const {
+    deleteGiftAssets,
+    deleteGiftFolder,
+    deleteByPrefix,
+    getFolderFromPublicId,
+    isCloudinaryConfigured
+} = require('../utils/cloudinary');
 
 const getDurationDaysForPlan = (plan) => {
     if (plan === 'momentum') return 7;
@@ -18,62 +22,6 @@ const getDurationDaysForPlan = (plan) => {
     return null;
 };
 
-const cloudinaryDestroy = ({ publicId, resourceType }) => {
-    const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
-    const apiKey = process.env.CLOUDINARY_API_KEY;
-    const apiSecret = process.env.CLOUDINARY_API_SECRET;
-    if (!cloudName || !apiKey || !apiSecret) {
-        return Promise.resolve({ ok: false, error: 'Cloudinary not configured' });
-    }
-    if (!publicId) {
-        return Promise.resolve({ ok: true });
-    }
-
-    const timestamp = Math.floor(Date.now() / 1000);
-    const toSign = `public_id=${publicId}&timestamp=${timestamp}${apiSecret}`;
-    const signature = crypto.createHash('sha1').update(toSign).digest('hex');
-
-    const postData = querystring.stringify({
-        public_id: publicId,
-        timestamp,
-        api_key: apiKey,
-        signature,
-    });
-
-    const path = `/v1_1/${cloudName}/${resourceType}/destroy`;
-
-    return new Promise((resolve) => {
-        const req = https.request(
-            {
-                hostname: 'api.cloudinary.com',
-                method: 'POST',
-                path,
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Content-Length': Buffer.byteLength(postData),
-                },
-            },
-            (res) => {
-                let data = '';
-                res.on('data', (chunk) => (data += chunk));
-                res.on('end', () => {
-                    try {
-                        const parsed = JSON.parse(data || '{}');
-                        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-                            return resolve({ ok: true, result: parsed });
-                        }
-                        return resolve({ ok: false, error: parsed?.error || parsed || data });
-                    } catch {
-                        return resolve({ ok: false, error: data });
-                    }
-                });
-            }
-        );
-        req.on('error', (err) => resolve({ ok: false, error: err?.message || err }));
-        req.write(postData);
-        req.end();
-    });
-};
 
 // GET /api/admin/users - Get all users with search and pagination
 router.get('/users', authMiddleware, requireAdmin, async (req, res) => {
@@ -358,34 +306,40 @@ router.delete('/gifts/:giftId/permanent', authMiddleware, requireAdmin, async (r
         const gift = await Gift.findById(giftId);
         if (!gift) return res.status(404).json({ error: 'Gift not found' });
 
-        // Delete Cloudinary assets (best-effort)
+        // Check if Cloudinary is configured
+        if (!isCloudinaryConfigured()) {
+            console.warn('⚠️ Cloudinary not configured - skipping file deletion');
+        }
+
+        // Get asset IDs
         const photoIds = Array.isArray(gift.photoPublicIds) ? gift.photoPublicIds : [];
         const audioId = gift.audioPublicId;
 
-        const results = [];
+        console.log('🗑️ Starting permanent gift deletion:', {
+            giftId,
+            photoIds,
+            audioId
+        });
 
-        // Delete photos
-        for (const pid of photoIds) {
-            const result = await cloudinaryDestroy({ publicId: pid, resourceType: 'image' });
-            results.push({ type: 'photo', publicId: pid, ...result });
-            if (result.ok) {
-                console.log(`✓ Deleted photo from Cloudinary: ${pid}`);
-            } else {
-                console.error(`✗ Failed to delete photo: ${pid}`, result.error);
+        let cloudinaryResults = { ok: true, photos: [], audio: null };
+
+        // Try to delete using the SDK
+        if (isCloudinaryConfigured()) {
+            // Method 1: Delete by individual public IDs
+            cloudinaryResults = await deleteGiftAssets(photoIds, audioId);
+
+            // Method 2: Also try folder-based deletion as backup
+            // This ensures all files in the gift folder are removed
+            if (photoIds.length > 0) {
+                const folderPath = getFolderFromPublicId(photoIds[0]);
+                if (folderPath) {
+                    console.log(`📁 Also deleting entire folder: ${folderPath}`);
+                    await deleteGiftFolder(folderPath);
+                }
             }
         }
 
-        // Delete audio
-        if (audioId) {
-            const result = await cloudinaryDestroy({ publicId: audioId, resourceType: 'video' });
-            results.push({ type: 'audio', publicId: audioId, ...result });
-            if (result.ok) {
-                console.log(`✓ Deleted audio from Cloudinary: ${audioId}`);
-            } else {
-                console.error(`✗ Failed to delete audio: ${audioId}`, result.error);
-            }
-        }
-
+        // Create tombstone record
         const tombstone = {
             permanentlyDeleted: true,
             deletedAt: new Date(),
@@ -396,15 +350,15 @@ router.delete('/gifts/:giftId/permanent', authMiddleware, requireAdmin, async (r
             audioPublicId: null,
         };
 
-        console.log('Admin permanent delete gift:', {
+        console.log('✓ Admin permanent delete completed:', {
             giftId,
             photoIdsCount: photoIds.length,
             hasAudio: !!audioId,
-            cloudinaryResults: results,
+            cloudinarySuccess: cloudinaryResults.ok,
         });
 
         const updatedGift = await Gift.findByIdAndUpdate(giftId, { $set: tombstone }, { new: true });
-        return res.json({ ok: true, giftId, gift: updatedGift, cloudinary: results });
+        return res.json({ ok: true, giftId, gift: updatedGift, cloudinary: cloudinaryResults });
     } catch (err) {
         console.error('Admin DELETE /gifts/:giftId/permanent error:', err);
         if (err && (err.name === 'CastError' || err.name === 'ValidationError')) {
