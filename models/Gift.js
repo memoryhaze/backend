@@ -25,37 +25,148 @@ const parseCloudinaryPublicIdFromUrl = (url) => {
     }
 };
 
+// Map occasion to template
+const getTemplateFromOccasion = (occasion) => {
+    switch (occasion) {
+        case 'birthday':
+            return 'birthday-celebration';
+        case 'anniversary':
+            return 'grand-anniversary';
+        case 'valentines':
+            return 'minimalist-love';
+        default:
+            return 'birthday-celebration';
+    }
+};
+
 const GiftSchema = new mongoose.Schema(
     {
+        // User who submitted the request
         user: {
             type: mongoose.Schema.Types.ObjectId,
             ref: 'User',
             required: true,
             index: true,
         },
-        templateId: {
+
+        // ===== USER-SUBMITTED FIELDS (from landing page form) =====
+
+        // Recipient information
+        recipientName: {
             type: String,
             required: true,
+            trim: true,
+        },
+
+        // Occasion details
+        occasion: {
+            type: String,
+            enum: ['birthday', 'anniversary', 'valentines'],
+            required: true,
+        },
+        occasionDate: {
+            type: Date,
+            required: true,
+        },
+
+        // Template (auto-derived from occasion)
+        templateId: {
+            type: String,
             enum: ['minimalist-love', 'grand-anniversary', 'birthday-celebration'],
         },
+
+        // Song customization
         scenarios: {
             type: [String],
             default: [],
+            validate: {
+                validator: function (v) {
+                    return v.length <= 3;
+                },
+                message: 'Maximum 3 scenarios allowed'
+            }
         },
-        memory: {
+        songGenre: {
             type: String,
-            enum: ['birthday', 'anniversary', 'valentines', null],
-            default: null,
+            required: true,
+            trim: true,
         },
+
+        // Photos (uploaded by user)
+        photos: {
+            type: [String],
+            default: [],
+        },
+        photoPublicIds: {
+            type: [String],
+            default: [],
+        },
+
+        // Plan selection
         plan: {
             type: String,
-            enum: ['momentum', 'everlasting', null],
+            enum: ['momentum', 'everlasting'],
+            required: true,
+        },
+
+        // Personal message from user
+        message: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+
+        // ===== ADMIN-ADDED FIELDS (during gift completion) =====
+
+        // Audio (uploaded by admin)
+        audio: {
+            type: String,
             default: null,
         },
-        assignedAt: {
+        audioPublicId: {
+            type: String,
+            default: null,
+        },
+
+        // Lyrics (written by admin)
+        lyrics: {
+            type: String,
+            default: '',
+        },
+
+        // ===== STATUS & WORKFLOW FIELDS =====
+
+        // Request status
+        status: {
+            type: String,
+            enum: ['pending', 'verified', 'rejected', 'completed'],
+            default: 'pending',
+            index: true,
+        },
+
+        // Timestamps for workflow
+        submittedAt: {
             type: Date,
             default: Date.now,
         },
+        verifiedAt: {
+            type: Date,
+            default: null,
+        },
+        completedAt: {
+            type: Date,
+            default: null,
+        },
+        rejectedAt: {
+            type: Date,
+            default: null,
+        },
+        rejectionReason: {
+            type: String,
+            default: null,
+        },
+
+        // Gift access control
         expiresAt: {
             type: Date,
             default: null,
@@ -63,7 +174,7 @@ const GiftSchema = new mongoose.Schema(
         },
         accessEnabled: {
             type: Boolean,
-            default: true,
+            default: false, // Changed to false - only enabled after completion
             index: true,
         },
         permanentlyDeleted: {
@@ -75,45 +186,41 @@ const GiftSchema = new mongoose.Schema(
             type: Date,
             default: null,
         },
-        photos: {
-            type: [String],
-            default: [],
-        },
-        photoPublicIds: {
-            type: [String],
-            default: [],
-        },
-        audio: {
+
+        // ===== LEGACY FIELD (for backwards compatibility) =====
+        memory: {
             type: String,
+            enum: ['birthday', 'anniversary', 'valentines', null],
             default: null,
-        },
-        audioPublicId: {
-            type: String,
-            default: null,
-        },
-        lyrics: {
-            type: String,
-            default: '',
-        },
-        message: {
-            type: String,
-            default: '',
         },
     },
     { timestamps: true }
 );
 
+// Pre-validate hook
 GiftSchema.pre('validate', async function () {
-    // Backwards compatibility: older records may have empty strings
+    // Backwards compatibility
     if (this.plan === '') this.plan = null;
-    if (this.memory === '') this.memory = null;
+    if (this.occasion === '') this.occasion = null;
 
-    // Compute expiresAt from assignedAt + plan duration
-    const days = getDurationDaysForPlan(this.plan);
-    if (days && this.assignedAt && !this.expiresAt) {
-        const d = new Date(this.assignedAt);
-        d.setDate(d.getDate() + days);
-        this.expiresAt = d;
+    // Auto-derive templateId from occasion
+    if (this.occasion && !this.templateId) {
+        this.templateId = getTemplateFromOccasion(this.occasion);
+    }
+
+    // Sync memory with occasion for backwards compatibility
+    if (this.occasion && !this.memory) {
+        this.memory = this.occasion;
+    }
+
+    // Compute expiresAt when gift is completed
+    if (this.status === 'completed' && this.completedAt && !this.expiresAt) {
+        const days = getDurationDaysForPlan(this.plan);
+        if (days) {
+            const d = new Date(this.completedAt);
+            d.setDate(d.getDate() + days);
+            this.expiresAt = d;
+        }
     }
 
     // Derive Cloudinary public IDs from URLs if not provided
@@ -123,12 +230,20 @@ GiftSchema.pre('validate', async function () {
     if (this.audio && !this.audioPublicId) {
         this.audioPublicId = parseCloudinaryPublicIdFromUrl(this.audio);
     }
-    // No need to call next() with async function - Mongoose 9.x handles this automatically
 });
 
+// Check if gift is expired
 GiftSchema.methods.isExpired = function () {
     if (!this.expiresAt) return false;
     return new Date() > new Date(this.expiresAt);
+};
+
+// Check if gift is viewable
+GiftSchema.methods.isViewable = function () {
+    return this.status === 'completed' &&
+        this.accessEnabled &&
+        !this.permanentlyDeleted &&
+        !this.isExpired();
 };
 
 module.exports = mongoose.model('Gift', GiftSchema);

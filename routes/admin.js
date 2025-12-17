@@ -372,4 +372,309 @@ router.delete('/gifts/:giftId/permanent', authMiddleware, requireAdmin, async (r
     }
 });
 
+// ===== GIFT REQUEST MANAGEMENT ENDPOINTS =====
+
+// GET /api/admin/requests - Get all gift requests with filtering and pagination
+router.get('/requests', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        const { status = 'all', page = 1, limit = 10, search = '' } = req.query;
+
+        // Build query
+        const query = { permanentlyDeleted: { $ne: true } };
+
+        if (status !== 'all') {
+            query.status = status;
+        }
+
+        // Calculate pagination
+        const pageNum = parseInt(page);
+        const limitNum = parseInt(limit);
+        const skip = (pageNum - 1) * limitNum;
+
+        // Get total count
+        const total = await Gift.countDocuments(query);
+
+        // Get requests with user info
+        const requests = await Gift.find(query)
+            .populate('user', 'email userId')
+            .sort({ submittedAt: -1 })
+            .skip(skip)
+            .limit(limitNum)
+            .select('user recipientName occasion occasionDate songGenre scenarios photos plan message status submittedAt verifiedAt completedAt');
+
+        // Format response
+        const formattedRequests = requests.map(req => ({
+            _id: req._id,
+            user: req.user ? {
+                _id: req.user._id,
+                email: req.user.email,
+                userId: req.user.userId,
+            } : null,
+            recipientName: req.recipientName,
+            occasion: req.occasion,
+            occasionDate: req.occasionDate,
+            songGenre: req.songGenre,
+            scenarios: req.scenarios,
+            photos: req.photos,
+            plan: req.plan,
+            message: req.message,
+            status: req.status,
+            submittedAt: req.submittedAt,
+            verifiedAt: req.verifiedAt,
+            completedAt: req.completedAt,
+        }));
+
+        res.json({
+            requests: formattedRequests,
+            total,
+            page: pageNum,
+            limit: limitNum,
+            totalPages: Math.ceil(total / limitNum),
+        });
+    } catch (err) {
+        console.error('Admin GET /requests error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// GET /api/admin/requests/stats - Get request counts by status
+router.get('/requests/stats', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        const stats = await Gift.aggregate([
+            { $match: { permanentlyDeleted: { $ne: true } } },
+            { $group: { _id: '$status', count: { $sum: 1 } } },
+        ]);
+
+        const counts = {
+            pending: 0,
+            verified: 0,
+            completed: 0,
+            rejected: 0,
+            total: 0,
+        };
+
+        stats.forEach(s => {
+            if (s._id && counts.hasOwnProperty(s._id)) {
+                counts[s._id] = s.count;
+            }
+            counts.total += s.count;
+        });
+
+        res.json(counts);
+    } catch (err) {
+        console.error('Admin GET /requests/stats error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// GET /api/admin/requests/:requestId - Get single request details
+router.get('/requests/:requestId', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        const { requestId } = req.params;
+
+        if (!mongoose.Types.ObjectId.isValid(requestId)) {
+            return res.status(400).json({ error: 'Invalid request ID' });
+        }
+
+        const request = await Gift.findById(requestId)
+            .populate('user', 'email userId name');
+
+        if (!request) {
+            return res.status(404).json({ error: 'Request not found' });
+        }
+
+        res.json({ request });
+    } catch (err) {
+        console.error('Admin GET /requests/:requestId error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// PATCH /api/admin/requests/:requestId/verify - Verify a pending request
+router.patch('/requests/:requestId/verify', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        const { requestId } = req.params;
+
+        if (!mongoose.Types.ObjectId.isValid(requestId)) {
+            return res.status(400).json({ error: 'Invalid request ID' });
+        }
+
+        const request = await Gift.findById(requestId);
+        if (!request) {
+            return res.status(404).json({ error: 'Request not found' });
+        }
+
+        if (request.status !== 'pending') {
+            return res.status(400).json({
+                error: `Cannot verify request with status '${request.status}'`
+            });
+        }
+
+        request.status = 'verified';
+        request.verifiedAt = new Date();
+        await request.save();
+
+        console.log('Request verified:', requestId);
+
+        res.json({
+            success: true,
+            message: 'Request verified successfully',
+            request: {
+                _id: request._id,
+                status: request.status,
+                verifiedAt: request.verifiedAt,
+            }
+        });
+    } catch (err) {
+        console.error('Admin PATCH /requests/:requestId/verify error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// PATCH /api/admin/requests/:requestId/reject - Reject a request and delete Cloudinary files
+router.patch('/requests/:requestId/reject', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        const { requestId } = req.params;
+        const { reason } = req.body || {};
+
+        if (!mongoose.Types.ObjectId.isValid(requestId)) {
+            return res.status(400).json({ error: 'Invalid request ID' });
+        }
+
+        const request = await Gift.findById(requestId);
+        if (!request) {
+            return res.status(404).json({ error: 'Request not found' });
+        }
+
+        if (request.status === 'completed') {
+            return res.status(400).json({
+                error: 'Cannot reject a completed gift'
+            });
+        }
+
+        // Delete Cloudinary files
+        let cloudinaryResults = { ok: true };
+        if (isCloudinaryConfigured()) {
+            const photoIds = Array.isArray(request.photoPublicIds) ? request.photoPublicIds : [];
+            const audioId = request.audioPublicId;
+
+            cloudinaryResults = await deleteGiftAssets(photoIds, audioId);
+
+            // Also try folder deletion
+            if (photoIds.length > 0) {
+                const folderPath = getFolderFromPublicId(photoIds[0]);
+                if (folderPath) {
+                    await deleteGiftFolder(folderPath);
+                }
+            }
+        }
+
+        request.status = 'rejected';
+        request.rejectedAt = new Date();
+        request.rejectionReason = reason || 'Request was rejected by admin';
+        request.photos = [];
+        request.photoPublicIds = [];
+        request.audio = null;
+        request.audioPublicId = null;
+        await request.save();
+
+        console.log('Request rejected:', requestId, 'Files deleted:', cloudinaryResults.ok);
+
+        res.json({
+            success: true,
+            message: 'Request rejected and files deleted',
+            cloudinary: cloudinaryResults,
+        });
+    } catch (err) {
+        console.error('Admin PATCH /requests/:requestId/reject error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// PATCH /api/admin/requests/:requestId/complete - Complete a verified request (add audio + lyrics)
+router.patch('/requests/:requestId/complete', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        const { requestId } = req.params;
+        const { audio, audioPublicId, lyrics } = req.body || {};
+
+        if (!mongoose.Types.ObjectId.isValid(requestId)) {
+            return res.status(400).json({ error: 'Invalid request ID' });
+        }
+
+        const request = await Gift.findById(requestId).populate('user', 'email');
+        if (!request) {
+            return res.status(404).json({ error: 'Request not found' });
+        }
+
+        if (request.status !== 'verified') {
+            return res.status(400).json({
+                error: `Can only complete verified requests. Current status: '${request.status}'`
+            });
+        }
+
+        if (!audio) {
+            return res.status(400).json({ error: 'Audio file is required to complete the gift' });
+        }
+
+        if (!lyrics || lyrics.trim() === '') {
+            return res.status(400).json({ error: 'Lyrics are required to complete the gift' });
+        }
+
+        // Update request to completed
+        request.status = 'completed';
+        request.completedAt = new Date();
+        request.audio = audio;
+        request.audioPublicId = audioPublicId || null;
+        request.lyrics = lyrics.trim();
+        request.accessEnabled = true;
+
+        // Calculate expiration based on plan
+        const days = getDurationDaysForPlan(request.plan);
+        if (days) {
+            const expiresAt = new Date(request.completedAt);
+            expiresAt.setDate(expiresAt.getDate() + days);
+            request.expiresAt = expiresAt;
+        }
+
+        await request.save();
+
+        console.log('Request completed:', {
+            requestId,
+            userId: request.user._id,
+            expiresAt: request.expiresAt,
+        });
+
+        // Send notification email
+        try {
+            const encryptedUserId = encryptUserId(request.user._id.toString());
+            await sendGiftNotificationEmail({
+                to: request.user.email,
+                giftId: request._id.toString(),
+                encryptedUserId,
+                occasion: request.occasion || 'special',
+                recipientName: request.recipientName,
+            });
+            console.log(`Gift notification email sent to ${request.user.email}`);
+        } catch (emailError) {
+            console.error('Failed to send gift notification email:', emailError.message);
+            // Don't fail the request if email fails
+        }
+
+        res.json({
+            success: true,
+            message: 'Gift created successfully! User has been notified.',
+            gift: {
+                _id: request._id,
+                status: request.status,
+                completedAt: request.completedAt,
+                expiresAt: request.expiresAt,
+            }
+        });
+    } catch (err) {
+        console.error('Admin PATCH /requests/:requestId/complete error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 module.exports = router;
+
